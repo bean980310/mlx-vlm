@@ -1,5 +1,6 @@
 import mlx.core as mx
 
+from mlx_lm.sample_utils import make_sampler, make_logits_processors, apply_top_k, apply_min_p, apply_top_p, apply_xtc, categorical_sampling, make_repetition_penalty
 
 def top_p_sampling(logits: mx.array, top_p: float, temperature: float) -> mx.array:
     """
