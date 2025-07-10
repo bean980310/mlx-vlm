@@ -13,7 +13,7 @@ from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .prompt_utils import apply_chat_template
-from .sample_utils import top_p_sampling
+from .sample_utils import top_p_sampling, apply_top_k, apply_top_p, apply_min_p
 from .utils import (
     StoppingCriteria,
     apply_repetition_penalty,
@@ -203,6 +203,8 @@ def generate_step(
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = 20,
     top_p: float = 1.0,
+    min_p: float = 0.0,
+    top_k: int = -1,
     logit_bias: Optional[Dict[int, float]] = None,
     prompt_cache: Optional[List[Any]] = None,
     max_kv_size: Optional[int] = None,
@@ -249,10 +251,18 @@ def generate_step(
         if temperature == 0:
             token = mx.argmax(logits, axis=-1)
         else:
+            sampling_methods = []
+            if top_k > 0:
+                sampling_methods.append(apply_top_k(logits, top_k))
             if top_p > 0 and top_p < 1.0:
-                token = top_p_sampling(logits, top_p, temperature)
-            else:
-                token = mx.random.categorical(logits * (1 / temperature))
+                sampling_methods.append(apply_top_p(logits, top_p))
+            if min_p != 0.0:
+                sampling_methods.append(apply_min_p(logits, min_p, min_tokens_to_keep=1))
+                
+            for method in sampling_methods:
+                logits = method(logits)
+                
+            token = mx.random.categorical(logits * (1 / temperature))
 
         return token, logprobs
 
