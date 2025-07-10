@@ -16,7 +16,6 @@ from mlx_vlm.generate import generate_step
 from mlx_vlm.prompt_utils import get_message_json
 from mlx_vlm.utils import load_image
 
-
 class MLXVisionChat:
     def __init__(
         self,

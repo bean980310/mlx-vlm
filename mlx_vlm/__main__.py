@@ -14,7 +14,6 @@ if __name__ == "__main__":
         "video_generate",
         "smolvlm_video_generate",
     }
-
     if len(sys.argv) < 2:
         raise ValueError(f"CLI requires a subcommand in {subcommands}")
     subcommand = sys.argv.pop(1)
