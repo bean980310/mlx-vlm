@@ -11,9 +11,10 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
 
-from .prompt_utils import get_message_json
-from .utils import load_image, stream_generate, generate_step, load
-from .sample_utils import make_sampler
+from mlx_vlm import load
+from mlx_vlm.generate import generate_step
+from mlx_vlm.prompt_utils import get_message_json
+from mlx_vlm.utils import load_image
 
 class MLXVisionChat:
     def __init__(
