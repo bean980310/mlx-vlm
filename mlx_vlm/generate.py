@@ -8,19 +8,14 @@ from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_reduce
 from mlx_lm.generate import maybe_quantize_kv_cache
 from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .prompt_utils import apply_chat_template
-from .sample_utils import top_p_sampling, apply_top_k, apply_top_p, apply_min_p
-from .utils import (
-    StoppingCriteria,
-    apply_repetition_penalty,
-    load,
-    prepare_inputs,
-    tree_reduce,
-)
+from .sample_utils import apply_min_p, apply_top_k, apply_top_p, top_p_sampling
+from .utils import StoppingCriteria, apply_repetition_penalty, load, prepare_inputs
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
@@ -263,11 +258,13 @@ def generate_step(
             if top_p > 0 and top_p < 1.0:
                 sampling_methods.append(apply_top_p(logits, top_p))
             if min_p != 0.0:
-                sampling_methods.append(apply_min_p(logits, min_p, min_tokens_to_keep=1))
-                
+                sampling_methods.append(
+                    apply_min_p(logits, min_p, min_tokens_to_keep=1)
+                )
+
             for method in sampling_methods:
                 logits = method(logits)
-                
+
             token = mx.random.categorical(logits * (1 / temperature))
 
         return token, logprobs

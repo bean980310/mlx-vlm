@@ -7,7 +7,7 @@ from typing import Callable, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map_with_path
-from mlx_lm.utils import dequantize_model, quantize_model, tree_flatten
+from mlx_lm.utils import dequantize_model, quantize_model
 
 from .utils import (
     MODEL_CONVERSION_DTYPES,
@@ -180,6 +180,7 @@ def convert(
 
     if upload_repo is not None:
         upload_to_hub(mlx_path, upload_repo, hf_path)
+
 
 def configure_parser() -> argparse.ArgumentParser:
     """
