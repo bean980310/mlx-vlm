@@ -181,7 +181,6 @@ def convert(
     if upload_repo is not None:
         upload_to_hub(mlx_path, upload_repo, hf_path)
 
-
 def configure_parser() -> argparse.ArgumentParser:
     """
     Configures and returns the argument parser for the script.

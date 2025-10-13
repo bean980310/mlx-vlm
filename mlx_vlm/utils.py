@@ -23,6 +23,7 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
+
 from .models.base import BaseImageProcessor
 from .tokenizer_utils import load_tokenizer
 from .trainer import apply_lora_layers
@@ -874,7 +875,6 @@ def prepare_inputs(
                 model_inputs[key] = mx.array(value)
 
     return model_inputs
-
 
 class StoppingCriteria:
     def __init__(self, eos_token_ids: List[int], tokenizer=None):
