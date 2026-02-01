@@ -2,6 +2,7 @@ import argparse
 import codecs
 import contextlib
 import functools
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
@@ -10,6 +11,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_reduce
 from mlx_lm.generate import maybe_quantize_kv_cache
+from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
 from .models import cache
@@ -145,6 +147,18 @@ def parse_arguments():
         default="main",
         help="The specific model version to use (branch, tag, commit).",
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Trust remote code when loading the model.",
+    )
+    parser.add_argument(
+        "--processor-kwargs",
+        type=json.loads,
+        default={},
+        help="Extra processor kwargs as JSON. "
+        'Example: --processor-kwargs \'{"cropping": false, "max_patches": 3}\'',
+    )
 
     return parser.parse_args()
 
@@ -171,7 +185,7 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
     model_bytes = tree_reduce(
         lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
     )
-    max_rec_size = mx.metal.device_info()["max_recommended_working_set_size"]
+    max_rec_size = mx.device_info()["max_recommended_working_set_size"]
     if model_bytes > 0.9 * max_rec_size:
         model_mb = model_bytes // 2**20
         max_rec_mb = max_rec_size // 2**20
@@ -225,23 +239,37 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    prefill_step_size: Optional[int] = 2048,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
 
     Args:
-        prompt (mx.array): The input prompt.
+        input_ids (mx.array): The input prompt token ids.
         model (nn.Module): The model to use for generation.
+        pixel_values: The pixel values for vision models (optional).
+        mask: The attention mask (optional).
+        max_tokens (int): Maximum number of tokens to generate. Default: ``256``.
         temperature (float): The temperature for sampling, if 0 the argmax is used.
           Default: ``0``.
         repetition_penalty (float, optional): The penalty factor for repeating
           tokens.
         repetition_context_size (int, optional): The number of tokens to
           consider for repetition penalty. Default: ``20``.
-        top_p (float, optional): Nulceus sampling, higher means model considers
+        top_p (float, optional): Nucleus sampling, higher means model considers
           more less likely words.
         logit_bias (dictionary, optional): Additive logit bias.
+        prompt_cache (list, optional): Pre-existing KV cache for the prompt.
+        max_kv_size (int, optional): Maximum KV cache size.
+        kv_bits (int, optional): Number of bits for KV cache quantization.
+        kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
+        quantized_kv_start (int): Start index for quantized KV cache. Default: ``0``.
+        logits_processors (list, optional): List of logits processor functions.
+        prefill_step_size (int): Number of tokens to process per prefill step.
+          Chunked prefill processes prompts in smaller chunks to reduce peak
+          memory usage. Default: ``2048``.
 
     Yields:
         Generator[Tuple[mx.array, mx.array], None, None]: A generator producing
@@ -290,6 +318,7 @@ def generate_step(
         )
 
     y = input_ids
+    tokens = None  # Track tokens for logits processors
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -304,6 +333,7 @@ def generate_step(
         repetition_context = repetition_context[-repetition_context_size:]
 
     def _step(y, **kwargs):
+        nonlocal tokens
         with mx.stream(generation_stream):
             nonlocal repetition_context
             if "decoder_input_ids" in kwargs:
@@ -319,6 +349,13 @@ def generate_step(
                 )
 
             logits = outputs.logits[:, -1, :]
+
+            # Apply logits processors before repetition penalty
+            if logits_processors:
+                # Efficiently update tokens by concatenating only the new token
+                tokens = mx.concat([tokens, y])
+                for processor in logits_processors:
+                    logits = processor(tokens, logits)
 
             if repetition_penalty:
                 logits = apply_repetition_penalty(
@@ -336,11 +373,64 @@ def generate_step(
             quantize_cache_fn(prompt_cache)
             return y, logprobs.squeeze(0)
 
-    outputs = model(input_ids, pixel_values, cache=prompt_cache, mask=mask, **kwargs)
+    # Get input embeddings (handles both multimodal and text-only)
+    embedding_output = model.get_input_embeddings(
+        input_ids, pixel_values, mask=mask, **kwargs
+    )
+
+    inputs_embeds = embedding_output.inputs_embeds
+
+    kwargs.update(
+        {
+            k: v
+            for k, v in embedding_output.to_dict().items()
+            if k != "inputs_embeds" and v is not None
+        }
+    )
+
+    if inputs_embeds.shape[1] > prefill_step_size:
+        # Chunked prefill with embeddings
+        total_tokens = inputs_embeds.shape[1]
+        input_offset = 0
+        with tqdm(total=total_tokens, desc="Prefill", unit="tok") as pbar:
+            while inputs_embeds.shape[1] > 1:
+                n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
+                model.language_model(
+                    inputs=input_ids[:, input_offset : input_offset + n_to_process],
+                    inputs_embeds=inputs_embeds[:, :n_to_process],
+                    cache=prompt_cache,
+                    **kwargs,
+                )
+                mx.eval([c.state for c in prompt_cache])
+                inputs_embeds = inputs_embeds[:, n_to_process:]
+                input_offset += n_to_process
+                quantize_cache_fn(prompt_cache)
+                mx.clear_cache()
+                pbar.update(n_to_process)
+
+        input_ids = input_ids[:, -1:]
+
+    # Final step with last embedding to get logits
+    outputs = model.language_model(
+        inputs=input_ids,
+        inputs_embeds=inputs_embeds,
+        cache=prompt_cache,
+        **kwargs,
+    )
 
     logits = outputs.logits[:, -1, :]
     quantize_cache_fn(prompt_cache)
+
+    if logits_processors:
+        # get the last token from input_ids
+        final_input_token = input_ids[0][-1].item()
+        tokens = mx.array([final_input_token])
+        for processor in logits_processors:
+            logits = processor(tokens, logits)
+
+    # Final sampling with processed logits
     y, logprobs = sample(logits)
+
     mx.async_eval(y)
 
     if outputs.cross_attention_states is not None:
@@ -389,14 +479,20 @@ def stream_generate(
     A generator producing text based on the given prompt from the model.
 
     Args:
-        prompt (mx.array): The input prompt.
         model (nn.Module): The model to use for generation.
-        max_tokens (int): The ma
-        kwargs: The remaining options get passed to :func:`generate_step`.
+        processor (PreTrainedTokenizer): The tokenizer/processor.
+        prompt (str): The input prompt text.
+        image (Union[str, List[str]], optional): Image path(s) or URL(s).
+        audio (Union[str, List[str]], optional): Audio file path(s).
+        prefill_step_size (int, optional): Number of tokens to process per prefill
+          step. When set, enables chunked prefill which processes long prompts in
+          smaller chunks to reduce peak memory usage.
+        kwargs: Additional options passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
 
     Yields:
-        Generator[Tuple[mx.array, mx.array]]: A generator producing text.
+        Generator[GenerationResult]: A generator producing GenerationResult objects
+          containing the generated text, tokens, and statistics.
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
@@ -1188,18 +1284,26 @@ def _generate_batch(
 
     with wired_limit(model, [generation_stream]):
         if pixel_values is not None:
-            inputs_embeds = model.get_input_embeddings(
+            embedding_output = model.get_input_embeddings(
                 input_ids, pixel_values, **data_kwargs
             )
+
+            # Normalize embedding output to a kwargs dict expected by BatchGenerator
+            if isinstance(embedding_output, dict):
+                embed_kwargs = embedding_output
+            elif hasattr(embedding_output, "to_dict"):
+                # Convert to dict and keep non-None fields
+                embed_kwargs = {
+                    k: v for k, v in embedding_output.to_dict().items() if v is not None
+                }
+            else:
+                # Assume it's directly an inputs_embeds array
+                embed_kwargs = {"inputs_embeds": embedding_output}
 
             gen_kwargs = {
                 "pixel_values": pixel_values,
                 **data_kwargs,
-                **(
-                    inputs_embeds
-                    if isinstance(inputs_embeds, dict)
-                    else {"inputs_embeds": inputs_embeds}
-                ),
+                **embed_kwargs,
             }
         else:
             input_ids = mx.squeeze(input_ids, axis=0)
@@ -1222,7 +1326,10 @@ def main():
         args.image = [args.image]
 
     model, processor = load(
-        args.model, args.adapter_path, revision=args.revision, trust_remote_code=True
+        args.model,
+        args.adapter_path,
+        revision=args.revision,
+        trust_remote_code=args.trust_remote_code,
     )
     config = model.config
 
@@ -1259,6 +1366,10 @@ def main():
 
     if args.skip_special_tokens:
         kwargs["skip_special_tokens"] = args.skip_special_tokens
+
+    # Add processor kwargs from JSON
+    if args.processor_kwargs:
+        kwargs.update(args.processor_kwargs)
 
     if args.chat:
         chat = []
